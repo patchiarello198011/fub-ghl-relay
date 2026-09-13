@@ -159,97 +159,111 @@ app.post('/webhooks/fub', async (req, res) => {
   res.sendStatus(200);
 
   const payload = req.body;
-  const eventId = payload.eventId || payload.id || `${Date.now()}`;
+  const eventId = payload.eventId || `${Date.now()}`;
+  const eventType = payload.event; // 'peopleStageUpdated', 'dealsUpdated', 'notesCreated', etc.
 
   if (store.hasProcessedEvent(`fub:${eventId}`)) {
     console.log(`Skipping already-processed FUB event ${eventId}`);
     return;
   }
 
-  const fubPersonId = payload.personId || payload.person?.id;
-  if (!fubPersonId) {
-    store.logDeadLetter({ direction: 'fub->ghl', reason: 'missing personId', payload });
-    return;
-  }
-
-  const mapping = store.getGhlContactIdForFubPerson(fubPersonId);
-  if (!mapping) {
-    store.logDeadLetter({
-      direction: 'fub->ghl',
-      reason: `no GHL mapping found for FUB person ${fubPersonId}`,
-      payload
-    });
-    return;
-  }
-
   try {
-    const eventType = payload.event; // e.g. 'peopleStageUpdated', 'dealsUpdated', 'notesCreated'
-
-    // Handle a note being created in FUB -> mirror it as a GHL note.
-    if (eventType === 'notesCreated' || payload.note) {
-      const noteBody = payload.note?.body || payload.body;
-      if (noteBody) {
-        await withRetry(() =>
-          ghl.createNote({ contactId: mapping.ghlContactId, body: `[From Follow Up Boss] ${noteBody}` })
-        );
-        console.log(`Synced note for GHL contact ${mapping.ghlContactId}`);
-      }
-    }
-
-    // Handle a PERSON stage change -> update the Person Stage pipeline opportunity.
+    // --- PERSON STAGE CHANGE ---
+    // This event is unusual in that FUB includes the new stage name directly
+    // in the payload (payload.data.stage) - no extra fetch needed.
     if (eventType === 'peopleStageUpdated') {
-      const newStageName = payload.stage || payload.stageName;
-      const stageInfo = newStageName ? await getGhlStageForPersonStage(newStageName) : null;
+      const fubPersonId = payload.resourceIds?.[0];
+      const newStageName = payload.data?.stage;
+      if (!fubPersonId || !newStageName) {
+        store.logDeadLetter({ direction: 'fub->ghl', reason: 'missing personId or stage in peopleStageUpdated payload', payload });
+        return;
+      }
 
+      const mapping = store.getGhlContactIdForFubPerson(fubPersonId);
+      if (!mapping) {
+        store.logDeadLetter({ direction: 'fub->ghl', reason: `no GHL mapping for FUB person ${fubPersonId}`, payload });
+        return;
+      }
+
+      const stageInfo = await getGhlStageForPersonStage(newStageName);
       if (!stageInfo) {
-        store.logDeadLetter({
-          direction: 'fub->ghl',
-          reason: `no Person Stage mapping found in GHL for FUB stage "${newStageName}"`,
-          payload
-        });
+        store.logDeadLetter({ direction: 'fub->ghl', reason: `no Person Stage mapping in GHL for "${newStageName}"`, payload });
       } else if (mapping.ghlPersonOpportunityId) {
-        await withRetry(() =>
-          ghl.updateOpportunityStage({
-            opportunityId: mapping.ghlPersonOpportunityId,
-            stageId: stageInfo.stageId
-          })
-        );
+        await withRetry(() => ghl.updateOpportunityStage({ opportunityId: mapping.ghlPersonOpportunityId, stageId: stageInfo.stageId }));
         console.log(`Updated GHL Person Stage for contact ${mapping.ghlContactId} -> ${newStageName}`);
       } else {
-        store.logDeadLetter({
-          direction: 'fub->ghl',
-          reason: 'no GHL Person Stage opportunity exists yet for this contact - it needs to be created first',
-          payload
-        });
+        store.logDeadLetter({ direction: 'fub->ghl', reason: 'no GHL Person Stage opportunity exists yet for this contact', payload });
       }
     }
 
-    // Handle a DEAL stage change -> update the Transactions pipeline opportunity.
+    // --- DEAL STAGE CHANGE ---
+    // FUB's dealsUpdated payload does NOT include the deal's current stage -
+    // we have to fetch the deal itself from payload.uri to find that out.
     if (eventType === 'dealsUpdated') {
-      const newStageName = payload.deal?.stage || payload.stage;
-      const stageInfo = newStageName ? await getGhlStageForDealStage(newStageName) : null;
+      const dealId = payload.resourceIds?.[0];
+      if (!dealId || !payload.uri) {
+        store.logDeadLetter({ direction: 'fub->ghl', reason: 'missing dealId or uri in dealsUpdated payload', payload });
+        return;
+      }
 
+      const dealData = await withRetry(() => fub.getResource(payload.uri));
+      const deal = dealData.deals?.[0] || dealData;
+      const newStageName = deal.stage || deal.stageName;
+      // FUB's deal schema isn't fully documented publicly - try the common
+      // shapes a deal might use to reference its associated person.
+      const fubPersonId =
+        deal.personId || deal.people?.[0]?.id || deal.peopleIds?.[0] || deal.contactId;
+
+      if (!fubPersonId) {
+        store.logDeadLetter({ direction: 'fub->ghl', reason: 'could not determine which person this deal belongs to', payload, dealData });
+        return;
+      }
+
+      const mapping = store.getGhlContactIdForFubPerson(fubPersonId);
+      if (!mapping) {
+        store.logDeadLetter({ direction: 'fub->ghl', reason: `no GHL mapping for FUB person ${fubPersonId}`, payload });
+        return;
+      }
+
+      const stageInfo = newStageName ? await getGhlStageForDealStage(newStageName) : null;
       if (!stageInfo) {
-        store.logDeadLetter({
-          direction: 'fub->ghl',
-          reason: `no Deal Stage mapping found in GHL for FUB stage "${newStageName}"`,
-          payload
-        });
+        store.logDeadLetter({ direction: 'fub->ghl', reason: `no Deal Stage mapping in GHL for "${newStageName}"`, payload, dealData });
       } else if (mapping.ghlDealOpportunityId) {
-        await withRetry(() =>
-          ghl.updateOpportunityStage({
-            opportunityId: mapping.ghlDealOpportunityId,
-            stageId: stageInfo.stageId
-          })
-        );
+        await withRetry(() => ghl.updateOpportunityStage({ opportunityId: mapping.ghlDealOpportunityId, stageId: stageInfo.stageId }));
         console.log(`Updated GHL Deal Stage for contact ${mapping.ghlContactId} -> ${newStageName}`);
       } else {
-        store.logDeadLetter({
-          direction: 'fub->ghl',
-          reason: 'no GHL Deal Stage opportunity exists yet for this contact - it needs to be created first',
-          payload
-        });
+        store.logDeadLetter({ direction: 'fub->ghl', reason: 'no GHL Deal Stage opportunity exists yet for this contact', payload });
       }
+    }
+
+    // --- NOTE CREATED ---
+    // Same situation - the webhook only gives us an ID and a link, so we
+    // fetch the actual note content before mirroring it into GHL.
+    if (eventType === 'notesCreated') {
+      const noteId = payload.resourceIds?.[0];
+      if (!noteId || !payload.uri) {
+        store.logDeadLetter({ direction: 'fub->ghl', reason: 'missing noteId or uri in notesCreated payload', payload });
+        return;
+      }
+
+      const noteData = await withRetry(() => fub.getResource(payload.uri));
+      const note = noteData.notes?.[0] || noteData;
+      const fubPersonId = note.personId;
+      const noteBody = note.body;
+
+      if (!fubPersonId || !noteBody) {
+        store.logDeadLetter({ direction: 'fub->ghl', reason: 'note missing personId or body', payload, noteData });
+        return;
+      }
+
+      const mapping = store.getGhlContactIdForFubPerson(fubPersonId);
+      if (!mapping) {
+        store.logDeadLetter({ direction: 'fub->ghl', reason: `no GHL mapping for FUB person ${fubPersonId}`, payload });
+        return;
+      }
+
+      await withRetry(() => ghl.createNote({ contactId: mapping.ghlContactId, body: `[From Follow Up Boss] ${noteBody}` }));
+      console.log(`Synced note for GHL contact ${mapping.ghlContactId}`);
     }
 
     store.markEventProcessed(`fub:${eventId}`);
